@@ -1,338 +1,552 @@
-import os
+"""
+معالج البوت والأوامر
+"""
 import asyncio
-import logging
-from urllib.parse import urlparse
-from typing import Dict
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes
-from telegram.ext import filters
-
-from config import BOT_TOKEN, DOWNLOAD_DIR
-from database import Database
-from downloader import Downloader
-
-# إعداد السجلات
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+import os
+from typing import Dict, Any, Optional
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    BufferedInputFile, FSInputFile
 )
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
+import humanize
+from config import config
+from database import db
+from downloader import downloader, DownloadProgress
+import logging
+
 logger = logging.getLogger(__name__)
 
-class BotHandler:
+class DownloadStates(StatesGroup):
+    """حالات التنزيل"""
+    waiting_url = State()
+    choosing_type = State()
+    choosing_quality = State()
+    choosing_subtitle_lang = State()
+    choosing_subtitle_format = State()
+    downloading = State()
+    playlist_confirm = State()
+
+class TelegramBot:
+    """فئة البوت الرئيسية"""
+    
     def __init__(self):
-        self.application = Application.builder().token(BOT_TOKEN).build()
-        self.db = Database()
-        self.downloader = Downloader()
+        self.bot = Bot(token=config.BOT_TOKEN)
+        self.storage = MemoryStorage()
+        self.dp = Dispatcher(storage=self.storage)
+        self.router = Router()
+        self.user_sessions: Dict[int, Dict] = {}
         self.setup_handlers()
     
     def setup_handlers(self):
-        """تكوين معالجات الأوامر"""
-        self.application.add_handler(CommandHandler("start", self.start_handler))
-        self.application.add_handler(CommandHandler("help", self.help_handler))
-        self.application.add_handler(CommandHandler("stats", self.stats_handler))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.url_handler))
-        self.application.add_handler(CallbackQueryHandler(self.callback_handler))
-    
-    async def start_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج أمر البدء"""
-        user = update.effective_user
+        """إعداد معالجات الأوامر"""
         
-        # تسجيل المستخدم في قاعدة البيانات
+        # الأوامر الأساسية
+        self.router.message(Command("start"))(self.cmd_start)
+        self.router.message(Command("help"))(self.cmd_help)
+        self.router.message(Command("stats"))(self.cmd_stats)
+        self.router.message(Command("settings"))(self.cmd_settings)
+        self.router.message(Command("cancel"))(self.cmd_cancel)
+        
+        # معالجة الروابط
+        self.router.message(F.text.contains("youtube.com") | F.text.contains("youtu.be"))(self.handle_url)
+        
+        # معالجة الأزرار
+        self.router.callback_query(F.data.startswith("download_"))(self.handle_download_callback)
+        self.router.callback_query(F.data.startswith("quality_"))(self.handle_quality_callback)
+        self.router.callback_query(F.data.startswith("subtitle_"))(self.handle_subtitle_callback)
+        self.router.callback_query(F.data.startswith("playlist_"))(self.handle_playlist_callback)
+        self.router.callback_query(F.data.startswith("settings_"))(self.handle_settings_callback)
+        
+        # تسجيل الموجه
+        self.dp.include_router(self.router)
+    
+    async def cmd_start(self, message: Message, state: FSMContext):
+        """أمر البدء"""
         user_data = {
-            'user_id': user.id,
-            'username': user.username,
-            'first_name': user.first_name,
-            'last_name': user.last_name
+            'id': message.from_user.id,
+            'username': message.from_user.username,
+            'first_name': message.from_user.first_name,
+            'last_name': message.from_user.last_name,
+            'language_code': message.from_user.language_code
         }
-        self.db.add_user(user_data)
         
-        welcome_text = """
-🎬 **مرحباً بك في بوت تنزيل الفيديوهات**
-
-✨ **الميزات المتوفرة:**
-• تنزيل الفيديوهات بجودات مختلفة
-• تنزيل قوائم التشغيل كاملة  
-• تنزيل الترجمات بلغات متعددة
-• عرض تقدم التحميل المباشر
-• إحصاءات شخصية عن التنزيلات
-
-📝 **كيفية الاستخدام:**
-فقط أرسل رابط الفيديو أو قائمة التشغيل
-
-🔗 **المواقع المدعومة:**
-YouTube, Vimeo, Facebook, Twitter, Instagram, TikTok وأكثر من 1000 موقع آخر
-
-للمساعدة: /help
-للإحصائيات: /stats
-        """
-        await update.message.reply_text(welcome_text, parse_mode="Markdown")
-    
-    async def help_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج أمر المساعدة"""
-        help_text = """
-📖 **دليل الاستخدام التفصيلي:**
-
-**1. تنزيل فيديو مفرد:**
-• أرسل رابط الفيديو
-• اختر الجودة المطلوبة
-• اختياري: تنزيل الترجمة
-
-**2. تنزيل قائمة تشغيل:**
-• أرسل رابط قائمة التشغيل
-• اختر الجودة لجميع الفيديوهات
-• اختياري: تنزيل ترجمات جميع الفيديوهات
-
-**3. خيارات الترجمة:**
-• ترجمات أصلية (إن وجدت)
-• ترجمات تلقائية من YouTube
-• صيغ متعددة: SRT, VTT
-
-**4. معلومات إضافية:**
-• عرض الحجم قبل التنزيل
-• تقدم التحميل المباشر
-• تقرير مفصل عند الانتهاء
-
-🚀 **لبدء التنزيل، أرسل الرابط الآن!**
-        """
-        await update.message.reply_text(help_text, parse_mode="Markdown")
-    
-    async def stats_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """عرض إحصائيات المستخدم"""
-        user_id = update.effective_user.id
-        user_stats = self.db.get_user_stats(user_id)
+        await db.create_or_update_user(user_data)
+        await state.clear()
         
-        if user_stats:
-            stats_text = f"""
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📝 المساعدة", callback_data="help")],
+            [InlineKeyboardButton(text="⚙️ الإعدادات", callback_data="settings_main")],
+            [InlineKeyboardButton(text="📊 الإحصائيات", callback_data="stats")]
+        ])
+        
+        await message.answer(config.Messages.WELCOME, reply_markup=keyboard)
+    
+    async def cmd_help(self, message: Message):
+        """أمر المساعدة"""
+        await message.answer(config.Messages.HELP)
+    
+    async def cmd_stats(self, message: Message):
+        """أمر الإحصائيات"""
+        user_stats = await db.get_user_stats(message.from_user.id)
+        
+        if not user_stats:
+            await message.answer("❌ لم يتم العثور على بيانات المستخدم")
+            return
+        
+        stats_text = f"""
 📊 **إحصائياتك الشخصية:**
 
-👤 **المستخدم:** {user_stats['first_name']}
-📥 **عدد التنزيلات:** {user_stats['downloads_count']}
-📅 **تاريخ الانضمام:** {user_stats['join_date'].split()[0]}
-🕒 **آخر تنزيل:** {user_stats['last_download'].split()[0] if user_stats['last_download'] else 'لا يوجد'}
-            """
-            await update.message.reply_text(stats_text, parse_mode="Markdown")
-        else:
-            await update.message.reply_text("❌ لم يتم العثور على إحصائيات للمستخدم")
-    
-    async def url_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج الروابط"""
-        url = update.message.text.strip()
+📥 إجمالي التنزيلات: `{user_stats['total_downloads']}`
+📁 التنزيلات الأخيرة: `{user_stats['recent_downloads']}`
+💾 إجمالي البيانات: `{user_stats['total_size']}`
+📅 عضو منذ: `{user_stats['member_since']}`
+🕐 آخر نشاط: `{user_stats['last_activity']}`
+        """
         
-        if not self.is_valid_url(url):
-            await update.message.reply_text("❌ الرجاء إرسال رابط صحيح")
+        await message.answer(stats_text, parse_mode="Markdown")
+    
+    async def cmd_settings(self, message: Message):
+        """أمر الإعدادات"""
+        await self.show_settings_menu(message.from_user.id, message)
+    
+    async def cmd_cancel(self, message: Message, state: FSMContext):
+        """إلغاء العملية الحالية"""
+        await state.clear()
+        if message.from_user.id in self.user_sessions:
+            del self.user_sessions[message.from_user.id]
+        
+        await message.answer("❌ تم إلغاء العملية الحالية")
+    
+    async def handle_url(self, message: Message, state: FSMContext):
+        """معالجة الروابط"""
+        url = message.text.strip()
+        
+        if not downloader.is_valid_url(url):
+            await message.answer(config.Messages.ERROR_INVALID_URL)
             return
         
-        # إرسال رسالة الانتظار
-        status_msg = await update.message.reply_text("🔄 جاري تحليل الرابط...")
+        # إظهار رسالة المعالجة
+        processing_msg = await message.answer(config.Messages.INFO_EXTRACTING_INFO)
         
         try:
-            video_info = await self.downloader.get_video_info(url)
-            await status_msg.delete()
-            
-            if video_info['is_playlist']:
-                await self.handle_playlist(update, video_info)
+            if downloader.is_playlist_url(url):
+                await self.handle_playlist_url(message, url, state, processing_msg)
             else:
-                await self.handle_single_video(update, video_info)
-                
+                await self.handle_video_url(message, url, state, processing_msg)
+        
         except Exception as e:
-            await status_msg.edit_text(f"❌ خطأ في تحليل الرابط: {str(e)}")
-            logger.error(f"Error processing URL: {e}")
+            logger.error(f"Error handling URL: {e}")
+            await processing_msg.edit_text("❌ حدث خطأ أثناء معالجة الرابط")
     
-    def is_valid_url(self, url: str) -> bool:
-        """التحقق من صحة الرابط"""
-        try:
-            result = urlparse(url)
-            return all([result.scheme, result.netloc])
-        except:
-            return False
-    
-    async def handle_single_video(self, update: Update, video_info: Dict):
-        """معالجة الفيديو المفرد"""
-        duration_str = self.downloader.format_duration(video_info['duration'])
+    async def handle_video_url(self, message: Message, url: str, state: FSMContext, processing_msg: Message):
+        """معالجة رابط فيديو"""
+        video_info = await downloader.extract_video_info(url)
         
-        info_text = f"""
-📹 **معلومات الفيديو:**
-
-🏷️ **العنوان:** {video_info['title']}
-⏱️ **المدة:** {duration_str}
-🌐 **الموقع:** {urlparse(video_info['url']).netloc}
-
-اختر نوع التنزيل:
-        """
-        
-        keyboard = [
-            [InlineKeyboardButton("🎥 تنزيل الفيديو", callback_data="download_video")],
-            [InlineKeyboardButton("📝 تنزيل الترجمة فقط", callback_data="download_subs_only")],
-            [InlineKeyboardButton("📦 تنزيل الفيديو + الترجمة", callback_data="download_both")]
-        ]
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=reply_markup)
-        
-        # حفظ معلومات الفيديو في السياق للمرحلة القادمة
-        context.user_data['video_info'] = video_info
-    
-    async def handle_playlist(self, update: Update, video_info: Dict):
-        """معالجة قائمة التشغيل"""
-        info_text = f"""
-📂 **معلومات قائمة التشغيل:**
-
-🏷️ **العنوان:** {video_info['title']}
-📊 **عدد الفيديوهات:** {video_info['playlist_count']}
-🌐 **الموقع:** {urlparse(video_info['url']).netloc}
-
-اختر نوع التنزيل:
-        """
-        
-        keyboard = [
-            [InlineKeyboardButton("🎬 تنزيل جميع الفيديوهات", callback_data="download_playlist_videos")],
-            [InlineKeyboardButton("📝 تنزيل جميع الترجمات", callback_data="download_playlist_subs")],
-            [InlineKeyboardButton("📦 تنزيل الكل", callback_data="download_playlist_all")]
-        ]
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=reply_markup)
-        
-        # حفظ معلومات الفيديو في السياق للمرحلة القادمة
-        context.user_data['video_info'] = video_info
-    
-    async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج الاستدعاء"""
-        query = update.callback_query
-        await query.answer()
-        
-        video_info = context.user_data.get('video_info')
         if not video_info:
-            await query.message.edit_text("❌ خطأ: لم يتم العثور على معلومات الفيديو")
+            await processing_msg.edit_text("❌ فشل في استخراج معلومات الفيديو")
             return
         
-        if query.data == "download_video":
-            await self.show_video_formats(query, video_info)
-        elif query.data == "download_subs_only":
-            await self.show_subtitle_options(query, video_info)
-        elif query.data == "download_both":
-            await self.show_video_formats(query, video_info, include_subs=True)
-        elif query.data.startswith("format_"):
-            await self.download_with_format(query, video_info, context)
-        elif query.data.startswith("sub_"):
-            await self.download_subtitles(query, video_info)
-        elif query.data.startswith("download_playlist"):
-            await self.handle_playlist_download(query, video_info)
-    
-    async def show_video_formats(self, query, video_info: Dict, include_subs: bool = False):
-        """عرض جودات الفيديو المتوفرة"""
-        # تحليل الصيغ المتاحة
-        formats = self.downloader.get_available_formats(video_info.get('formats', []))
+        # حفظ معلومات الجلسة
+        self.user_sessions[message.from_user.id] = {
+            'url': url,
+            'video_info': video_info,
+            'type': 'video'
+        }
         
-        if not formats:
-            await query.message.edit_text("❌ لم يتم العثور على صيغ متوفرة للتنزيل")
+        # إنشاء معاينة الفيديو
+        duration_str = self._format_duration(video_info.duration)
+        view_count_str = humanize.intcomma(video_info.view_count)
+        
+        video_preview = f"""
+🎬 **{video_info.title}**
+
+👤 **القناة:** {video_info.uploader}
+⏱ **المدة:** {duration_str}  
+👁 **المشاهدات:** {view_count_str}
+
+**اختر نوع التنزيل:**
+        """
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📹 فيديو فقط", callback_data="download_video")],
+            [InlineKeyboardButton(text="📝 ترجمة فقط", callback_data="download_subtitle")],
+            [InlineKeyboardButton(text="📹📝 فيديو + ترجمة", callback_data="download_both")],
+            [InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")]
+        ])
+        
+        await processing_msg.edit_text(video_preview, reply_markup=keyboard, parse_mode="Markdown")
+        await state.set_state(DownloadStates.choosing_type)
+    
+    async def handle_playlist_url(self, message: Message, url: str, state: FSMContext, processing_msg: Message):
+        """معالجة رابط قائمة التشغيل"""
+        playlist_info = await downloader.extract_playlist_info(url)
+        
+        if not playlist_info:
+            await processing_msg.edit_text("❌ فشل في استخراج معلومات قائمة التشغيل")
             return
         
-        keyboard = []
-        for fmt in formats:
-            size_info = f" ({fmt['filesize_str']})" if fmt['filesize_str'] else ""
-            button_text = f"{fmt['quality']} - {fmt['ext'].upper()}{size_info}"
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"format_{fmt['format_id']}")])
+        total_videos = len(playlist_info.entries)
         
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        text = "🎥 **اختر جودة الفيديو:**\n\n"
-        if include_subs:
-            text += "📝 سيتم تنزيل الترجمة أيضاً إن وجدت\n\n"
-        
-        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-        
-        # حفظ معلومات إضافية في السياق
-        context.user_data['include_subs'] = include_subs
-    
-    async def show_subtitle_options(self, query, video_info: Dict):
-        """عرض خيارات الترجمة"""
-        subtitles = video_info.get('subtitles', {})
-        
-        if not subtitles:
-            await query.message.edit_text("❌ لا توجد ترجمات متوفرة لهذا الفيديو")
+        if total_videos > config.MAX_PLAYLIST_SIZE:
+            await processing_msg.edit_text(config.Messages.ERROR_PLAYLIST_TOO_LARGE)
             return
         
-        keyboard = []
-        for lang_code, subs in subtitles.items():
-            lang_name = self.downloader.get_language_name(lang_code)
-            for sub in subs:
-                ext = sub.get('ext', 'srt')
-                button_text = f"{lang_name} ({ext.upper()})"
-                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"sub_{lang_code}_{ext}")])
+        # حفظ معلومات الجلسة
+        self.user_sessions[message.from_user.id] = {
+            'url': url,
+            'playlist_info': playlist_info,
+            'type': 'playlist'
+        }
         
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        # إنشاء معاينة قائمة التشغيل
+        playlist_preview = f"""
+📑 **قائمة التشغيل:** {playlist_info.title}
+
+👤 **المنشئ:** {playlist_info.uploader}
+🎬 **عدد الفيديوهات:** {total_videos}
+
+⚠️ **تنبيه:** سيتم تنزيل جميع الفيديوهات في قائمة التشغيل
+
+**هل تريد المتابعة؟**
+        """
         
-        await query.message.edit_text("📝 **اختر الترجمة:**", parse_mode="Markdown", reply_markup=reply_markup)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ تأكيد التنزيل", callback_data="playlist_confirm")],
+            [InlineKeyboardButton(text="👁 معاينة الفيديوهات", callback_data="playlist_preview")],
+            [InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")]
+        ])
+        
+        await processing_msg.edit_text(playlist_preview, reply_markup=keyboard, parse_mode="Markdown")
+        await state.set_state(DownloadStates.playlist_confirm)
     
-    async def download_with_format(self, query, video_info: Dict, context: ContextTypes.DEFAULT_TYPE):
-        """تنزيل الفيديو بالجودة المحددة"""
-        format_id = query.data.split('_')[1]
-        include_subs = context.user_data.get('include_subs', False)
+    async def handle_download_callback(self, callback: CallbackQuery, state: FSMContext):
+        """معالجة اختيار نوع التنزيل"""
+        user_id = callback.from_user.id
+        download_type = callback.data.split("_")[1]
         
-        progress_msg = await query.message.edit_text("🚀 بدء التنزيل...")
+        if user_id not in self.user_sessions:
+            await callback.answer("❌ الجلسة منتهية الصلاحية، يرجى إرسال الرابط مرة أخرى")
+            return
+        
+        session = self.user_sessions[user_id]
+        session['download_type'] = download_type
+        
+        if download_type == "video":
+            await self.show_quality_selection(callback, session['video_info'])
+        elif download_type == "subtitle":
+            await self.show_subtitle_language_selection(callback, session['video_info'])
+        elif download_type == "both":
+            await self.show_quality_selection(callback, session['video_info'], include_subtitle=True)
+        
+        await callback.answer()
+    
+    async def show_quality_selection(self, callback: CallbackQuery, video_info, include_subtitle=False):
+        """عرض اختيار الجودة"""
+        qualities = downloader.get_available_qualities(video_info)
+        
+        if not qualities:
+            await callback.message.edit_text("❌ لا توجد جودات متاحة لهذا الفيديو")
+            return
+        
+        keyboard_buttons = []
+        for quality_info in qualities:
+            size_str = humanize.naturalsize(quality_info['filesize']) if quality_info['filesize'] else "غير محدد"
+            button_text = f"{quality_info['quality']} ({size_str})"
+            callback_data = f"quality_{quality_info['quality']}"
+            keyboard_buttons.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
+        
+        keyboard_buttons.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_type")])
+        keyboard_buttons.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        
+        text = "📊 **اختر الجودة المطلوبة:**\n\n"
+        if include_subtitle:
+            text += "ℹ️ ستتمكن من اختيار الترجمة بعد تحديد الجودة"
+        
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    
+    async def handle_quality_callback(self, callback: CallbackQuery, state: FSMContext):
+        """معالجة اختيار الجودة"""
+        user_id = callback.from_user.id
+        quality = callback.data.split("_")[1]
+        
+        if user_id not in self.user_sessions:
+            await callback.answer("❌ الجلسة منتهية الصلاحية")
+            return
+        
+        session = self.user_sessions[user_id]
+        session['quality'] = quality
+        
+        if session['download_type'] == "both":
+            await self.show_subtitle_language_selection(callback, session['video_info'])
+        else:
+            await self.start_download(callback, state)
+        
+        await callback.answer()
+    
+    async def show_subtitle_language_selection(self, callback: CallbackQuery, video_info):
+        """عرض اختيار لغة الترجمة"""
+        available_subs = downloader.get_available_subtitles(video_info)
+        
+        if not available_subs:
+            await callback.message.edit_text("❌ لا توجد ترجمات متاحة لهذا الفيديو")
+            return
+        
+        keyboard_buttons = []
+        for lang_code, sub_info in available_subs.items():
+            sub_type = "🔄" if sub_info['type'] == 'auto' else "✅"
+            button_text = f"{sub_type} {sub_info['language']}"
+            callback_data = f"subtitle_lang_{lang_code}"
+            keyboard_buttons.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
+        
+        keyboard_buttons.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_quality")])
+        keyboard_buttons.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        
+        text = """
+🌍 **اختر لغة الترجمة:**
+
+✅ = ترجمة أصلية
+🔄 = ترجمة تلقائية
+        """
+        
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    
+    async def handle_subtitle_callback(self, callback: CallbackQuery, state: FSMContext):
+        """معالجة اختيار الترجمة"""
+        user_id = callback.from_user.id
+        action = callback.data.split("_")[1]
+        
+        if user_id not in self.user_sessions:
+            await callback.answer("❌ الجلسة منتهية الصلاحية")
+            return
+        
+        session = self.user_sessions[user_id]
+        
+        if action == "lang":
+            lang_code = callback.data.split("_")[2]
+            session['subtitle_lang'] = lang_code
+            await self.show_subtitle_format_selection(callback)
+        elif action == "format":
+            format_type = callback.data.split("_")[2]
+            session['subtitle_format'] = format_type
+            await self.start_download(callback, state)
+        
+        await callback.answer()
+    
+    async def show_subtitle_format_selection(self, callback: CallbackQuery):
+        """عرض اختيار صيغة الترجمة"""
+        keyboard_buttons = []
+        for fmt in config.SUBTITLE_FORMATS:
+            button_text = fmt.upper()
+            callback_data = f"subtitle_format_{fmt}"
+            keyboard_buttons.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
+        
+        keyboard_buttons.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_subtitle_lang")])
+        keyboard_buttons.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        
+        await callback.message.edit_text("📄 **اختر صيغة الترجمة:**", reply_markup=keyboard)
+    
+    async def handle_playlist_callback(self, callback: CallbackQuery, state: FSMContext):
+        """معالجة قوائم التشغيل"""
+        user_id = callback.from_user.id
+        action = callback.data.split("_")[1]
+        
+        if user_id not in self.user_sessions:
+            await callback.answer("❌ الجلسة منتهية الصلاحية")
+            return
+        
+        session = self.user_sessions[user_id]
+        
+        if action == "confirm":
+            await self.show_quality_selection(callback, None)  # سيحتاج تعديل للقوائم
+        elif action == "preview":
+            await self.show_playlist_preview(callback, session['playlist_info'])
+        
+        await callback.answer()
+    
+    async def show_playlist_preview(self, callback: CallbackQuery, playlist_info):
+        """عرض معاينة قائمة التشغيل"""
+        entries = playlist_info.entries[:10]  # أول 10 فيديوهات
+        preview_text = f"📑 **معاينة قائمة التشغيل:** {playlist_info.title}\n\n"
+        
+        for i, entry in enumerate(entries, 1):
+            title = entry.get('title', 'عنوان غير متاح')[:50]
+            duration = self._format_duration(entry.get('duration', 0))
+            preview_text += f"{i}. {title} ({duration})\n"
+        
+        if len(playlist_info.entries) > 10:
+            preview_text += f"\n... و {len(playlist_info.entries) - 10} فيديوهات أخرى"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ تأكيد التنزيل", callback_data="playlist_confirm")],
+            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_playlist")],
+            [InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")]
+        ])
+        
+        await callback.message.edit_text(preview_text, reply_markup=keyboard, parse_mode="Markdown")
+    
+    async def start_download(self, callback: CallbackQuery, state: FSMContext):
+        """بدء عملية التنزيل"""
+        user_id = callback.from_user.id
+        session = self.user_sessions[user_id]
+        
+        # تحديث الرسالة لإظهار بدء التنزيل
+        await callback.message.edit_text(config.Messages.INFO_DOWNLOADING)
         
         try:
-            def progress_hook(d):
-                if d['status'] == 'downloading':
-                    asyncio.create_task(progress_msg.edit_text(
-                        f"⬇️ **جاري التنزيل...**\n\n"
-                        f"📊 التقدم: {d.get('_percent_str', '0%')}\n"
-                        f"🚀 السرعة: {d.get('_speed_str', 'N/A')}"
-                    ))
-                elif d['status'] == 'finished':
-                    asyncio.create_task(progress_msg.edit_text("✅ تم التنزيل! جاري المعالجة..."))
-            
-            file_path = await self.downloader.download_video(
-                video_info['url'], 
-                format_id, 
-                query.message.chat.id,
-                progress_hook,
-                include_subs
+            if session['type'] == 'video':
+                await self.download_video(callback, session, state)
+            elif session['type'] == 'playlist':
+                await self.download_playlist(callback, session, state)
+        
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            await callback.message.edit_text(f"❌ فشل في التنزيل: {str(e)}")
+        
+        # تنظيف الجلسة
+        if user_id in self.user_sessions:
+            del self.user_sessions[user_id]
+        
+        await state.clear()
+    
+    async def download_video(self, callback: CallbackQuery, session: Dict, state: FSMContext):
+        """تنزيل فيديو واحد"""
+        user_id = callback.from_user.id
+        progress_msg = None
+        
+        async def progress_callback(progress: DownloadProgress):
+            nonlocal progress_msg
+            try:
+                percent = progress.percent if progress.percent else 0
+                speed_str = humanize.naturalsize(progress.speed) if progress.speed else "0"
+                downloaded_str = humanize.naturalsize(progress.downloaded_bytes)
+                total_str = humanize.naturalsize(progress.total_bytes) if progress.total_bytes else "غير محدد"
+                
+                progress_text = f"""
+⬇️ **جاري التنزيل...**
+
+📊 التقدم: {percent:.1f}%
+📥 تم تنزيل: {downloaded_str} / {total_str}
+🚀 السرعة: {speed_str}/ث
+                """
+                
+                if progress_msg:
+                    try:
+                        await progress_msg.edit_text(progress_text, parse_mode="Markdown")
+                    except TelegramBadRequest:
+                        pass  # تجاهل الأخطاء إذا كان النص مطابق
+                else:
+                    progress_msg = await callback.message.edit_text(progress_text, parse_mode="Markdown")
+                    
+            except Exception as e:
+                logger.error(f"Progress callback error: {e}")
+        
+        # تنزيل الفيديو
+        if session['download_type'] in ['video', 'both']:
+            file_path = await downloader.download_video(
+                session['url'],
+                session['quality'],
+                user_id,
+                progress_callback
             )
             
-            if file_path:
-                # تحديث إحصائيات المستخدم
-                self.db.increment_download_count(query.from_user.id)
-                
-                # تسجيل في سجل التنزيلات
-                download_data = {
-                    'user_id': query.from_user.id,
-                    'url': video_info['url'],
-                    'title': video_info['title'],
-                    'quality': format_id,
-                    'file_size': os.path.getsize(file_path),
-                    'status': 'completed'
-                }
-                self.db.add_download_history(download_data)
-                
-                await self.send_downloaded_file(query.message, file_path)
-            else:
-                await progress_msg.edit_text("❌ فشل في التنزيل")
-                
-        except Exception as e:
-            await progress_msg.edit_text(f"❌ خطأ في التنزيل: {str(e)}")
-            logger.error(f"Download error: {e}")
+            if file_path and os.path.exists(file_path):
+                await self.send_file(callback.message, file_path, "video")
+        
+        # تنزيل الترجمة
+        if session['download_type'] in ['subtitle', 'both']:
+            subtitle_path = await downloader.download_subtitle(
+                session['url'],
+                session['subtitle_lang'],
+                session['subtitle_format'],
+                user_id
+            )
+            
+            if subtitle_path and os.path.exists(subtitle_path):
+                await self.send_file(callback.message, subtitle_path, "document")
+        
+        await callback.message.edit_text(config.Messages.SUCCESS_DOWNLOAD)
     
-    async def send_downloaded_file(self, message, file_path: str):
-        """إرسال الملف المُنزل"""
+    async def download_playlist(self, callback: CallbackQuery, session: Dict, state: FSMContext):
+        """تنزيل قائمة التشغيل"""
+        user_id = callback.from_user.id
+        progress_msg = None
+        
+        async def progress_callback(message: str):
+            nonlocal progress_msg
+            try:
+                if progress_msg:
+                    await progress_msg.edit_text(f"📥 {message}")
+                else:
+                    progress_msg = await callback.message.edit_text(f"📥 {message}")
+            except TelegramBadRequest:
+                pass
+        
+        result = await downloader.download_playlist(
+            session['url'],
+            session['quality'],
+            user_id,
+            progress_callback=progress_callback
+        )
+        
+        if result['status'] == 'failed':
+            await callback.message.edit_text(f"❌ فشل تنزيل قائمة التشغيل: {result.get('error', 'خطأ غير محدد')}")
+            return
+        
+        # إرسال ملخص النتائج
+        summary = f"""
+✅ **تم الانتهاء من تنزيل قائمة التشغيل**
+
+📊 **النتائج:**
+• العدد الكلي: {result['total_videos']}
+• تم بنجاح: {result['completed']}
+• فشل: {result['failed']}
+
+📁 تم حفظ الملفات في مجلد منفصل
+        """
+        
+        await callback.message.edit_text(summary, parse_mode="Markdown")
+        
+        # إرسال الملفات (الأوائل فقط لتجنب الحد الأقصى)
+        for file_path in result['downloaded_files'][:5]:
+            if os.path.exists(file_path):
+                await self.send_file(callback.message, file_path, "video")
+        
+        if len(result['downloaded_files']) > 5:
+            await callback.message.answer(f"📁 تم تنزيل {len(result['downloaded_files']) - 5} ملفات إضافية")
+    
+    async def send_file(self, message: Message, file_path: str, file_type: str):
+        """إرسال الملف للمستخدم"""
         try:
             file_size = os.path.getsize(file_path)
+            
+            # التحقق من حجم الملف (حد تليجرام 50 ميجا للبوت)
+            if file_size > 50 * 1024 * 1024:
+                await message.answer(f"❌ الملف كبير جداً للإرسال: {humanize.naturalsize(file_size)}")
+                return
+            
             file_name = os.path.basename(file_path)
             
-            if file_size > 50 * 1024 * 1024:  # أكبر من 50 ميجا
-                await message.reply_text(
-                    f"📁 **تم التنزيل بنجاح!**\n\n"
-                    f"📄 اسم الملف: {file_name}\n"
-                    f"📊 الحجم: {self.downloader.format_filesize(file_size)}\n\n"
-                    f"⚠️ الملف كبير جداً لإرساله عبر تليجرام. "
-                    f"يمكنك العثور عليه في مجلد التنزيل."
+            if file_type == "video":
+                await message.answer_video(
+                    FSInputFile(file_path),
+                    caption=f"🎬 {file_name}"
                 )
             else:
-                await message.reply_document(
-                    document=open(file_path, 'rb'),
-                    caption=f"✅ تم التنزيل بنجاح!\n📊 الحجم: {self.downloader.format_filesize(file_size)}"
+                await message.answer_document(
+                    FSInputFile(file_path),
+                    caption=f"📄 {file_name}"
                 )
             
             # حذف الملف بعد الإرسال
@@ -340,64 +554,60 @@ YouTube, Vimeo, Facebook, Twitter, Instagram, TikTok وأكثر من 1000 موق
             
         except Exception as e:
             logger.error(f"Error sending file: {e}")
-            await message.reply_text("❌ خطأ في إرسال الملف")
+            await message.answer(f"❌ فشل في إرسال الملف: {file_name}")
     
-    async def handle_playlist_download(self, query, video_info: Dict):
-        """معالجة تنزيل قائمة التشغيل"""
-        progress_msg = await query.message.edit_text("📥 جاري تحضير قائمة التشغيل للتنزيل...")
+    async def show_settings_menu(self, user_id: int, message: Message):
+        """عرض قائمة الإعدادات"""
+        user = await db.get_user(user_id)
         
-        try:
-            def progress_hook(d):
-                if d['status'] == 'downloading':
-                    asyncio.create_task(progress_msg.edit_text(
-                        f"⬇️ **جاري تنزيل قائمة التشغيل...**\n\n"
-                        f"📊 التقدم: {d.get('_percent_str', '0%')}\n"
-                        f"🚀 السرعة: {d.get('_speed_str', 'N/A')}"
-                    ))
-            
-            success_count = await self.downloader.download_playlist(
-                video_info['url'],
-                query.message.chat.id,
-                progress_hook
-            )
-            
-            await progress_msg.edit_text(f"✅ تم تنزيل {success_count} من أصل {video_info['playlist_count']} فيديو بنجاح!")
-            
-            # تحديث إحصائيات المستخدم
-            self.db.increment_download_count(query.from_user.id)
-            
-        except Exception as e:
-            await progress_msg.edit_text(f"❌ خطأ في تنزيل قائمة التشغيل: {str(e)}")
-            logger.error(f"Playlist download error: {e}")
+        settings_text = f"""
+⚙️ **إعداداتك الحالية:**
+
+🎥 الجودة المفضلة: `{user.preferred_quality}`
+🌍 لغة الترجمة: `{config.SUPPORTED_LANGUAGES.get(user.preferred_subtitle_lang, 'غير محدد')}`
+📄 صيغة الترجمة: `{user.preferred_subtitle_format.upper()}`
+        """
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎥 تغيير الجودة", callback_data="settings_quality")],
+            [InlineKeyboardButton(text="🌍 تغيير لغة الترجمة", callback_data="settings_subtitle_lang")],
+            [InlineKeyboardButton(text="📄 تغيير صيغة الترجمة", callback_data="settings_subtitle_format")],
+            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main")]
+        ])
+        
+        await message.answer(settings_text, reply_markup=keyboard, parse_mode="Markdown")
     
-    async def download_subtitles(self, query, video_info: Dict):
-        """تنزيل الترجمات"""
-        parts = query.data.split('_')
-        lang_code = parts[1]
-        ext = parts[2]
+    async def handle_settings_callback(self, callback: CallbackQuery):
+        """معالجة إعدادات المستخدم"""
+        user_id = callback.from_user.id
+        setting_type = callback.data.split("_")[1]
         
-        progress_msg = await query.message.edit_text("📝 جاري تنزيل الترجمة...")
-        
-        try:
-            subtitle_path = await self.downloader.download_subtitles(
-                video_info['url'],
-                lang_code,
-                ext,
-                query.message.chat.id
-            )
-            
-            if subtitle_path:
-                await query.message.reply_document(
-                    document=open(subtitle_path, 'rb'),
-                    caption=f"📝 ترجمة {self.downloader.get_language_name(lang_code)} ({ext.upper()})"
-                )
-                os.remove(subtitle_path)
-            else:
-                await progress_msg.edit_text("❌ فشل في تنزيل الترجمة")
-                
-        except Exception as e:
-            await progress_msg.edit_text(f"❌ خطأ في تنزيل الترجمة: {str(e)}")
+        # هنا يمكن إضافة معالجة تغيير الإعدادات
+        await callback.answer("🔧 هذه الميزة قيد التطوير")
     
-    def run(self):
-        """تشغيل البوت"""
-        self.application.run_polling()
+    def _format_duration(self, seconds: int) -> str:
+        """تنسيق المدة الزمنية"""
+        if seconds < 60:
+            return f"{seconds}ث"
+        elif seconds < 3600:
+            minutes = seconds // 60
+            secs = seconds % 60
+            return f"{minutes}د {secs}ث"
+        else:
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            return f"{hours}س {minutes}د"
+    
+    async def start_polling(self):
+        """بدء استقبال الرسائل"""
+        await db.init_db()
+        logger.info("Bot started polling...")
+        await self.dp.start_polling(self.bot)
+    
+    async def stop(self):
+        """إيقاف البوت"""
+        await self.bot.session.close()
+        await db.close()
+
+# مثيل عام من البوت
+bot_handler = TelegramBot()
