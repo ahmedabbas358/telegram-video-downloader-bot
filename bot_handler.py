@@ -161,7 +161,7 @@ class TelegramBot:
         
         # إنشاء معاينة الفيديو
         duration_str = self._format_duration(video_info.duration)
-        view_count_str = humanize.intcomma(video_info.view_count)
+        view_count_str = humanize.intcomma(video_info.view_count) if video_info.view_count else "غير متاح"
         
         video_preview = f"""
 🎬 **{video_info.title}**
@@ -191,7 +191,7 @@ class TelegramBot:
             await processing_msg.edit_text("❌ فشل في استخراج معلومات قائمة التشغيل")
             return
         
-        total_videos = len(playlist_info.entries)
+        total_videos = len(playlist_info.entries) if playlist_info.entries else 0
         
         if total_videos > config.MAX_PLAYLIST_SIZE:
             await processing_msg.edit_text(config.Messages.ERROR_PLAYLIST_TOO_LARGE)
@@ -237,17 +237,26 @@ class TelegramBot:
         session = self.user_sessions[user_id]
         session['download_type'] = download_type
         
+        video_info = session.get('video_info')
+        if not video_info:
+            await callback.message.edit_text("❌ لا يمكن العثور على معلومات الفيديو")
+            return
+        
         if download_type == "video":
-            await self.show_quality_selection(callback, session['video_info'])
+            await self.show_quality_selection(callback, video_info)
         elif download_type == "subtitle":
-            await self.show_subtitle_language_selection(callback, session['video_info'])
+            await self.show_subtitle_language_selection(callback, video_info)
         elif download_type == "both":
-            await self.show_quality_selection(callback, session['video_info'], include_subtitle=True)
+            await self.show_quality_selection(callback, video_info, include_subtitle=True)
         
         await callback.answer()
     
     async def show_quality_selection(self, callback: CallbackQuery, video_info, include_subtitle=False):
         """عرض اختيار الجودة"""
+        if not video_info:
+            await callback.message.edit_text("❌ لا يمكن الحصول على معلومات الفيديو")
+            return
+        
         qualities = downloader.get_available_qualities(video_info)
         
         if not qualities:
@@ -256,7 +265,7 @@ class TelegramBot:
         
         keyboard_buttons = []
         for quality_info in qualities:
-            size_str = humanize.naturalsize(quality_info['filesize']) if quality_info['filesize'] else "غير محدد"
+            size_str = humanize.naturalsize(quality_info['filesize']) if quality_info.get('filesize') else "غير محدد"
             button_text = f"{quality_info['quality']} ({size_str})"
             callback_data = f"quality_{quality_info['quality']}"
             keyboard_buttons.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
@@ -284,8 +293,12 @@ class TelegramBot:
         session = self.user_sessions[user_id]
         session['quality'] = quality
         
-        if session['download_type'] == "both":
-            await self.show_subtitle_language_selection(callback, session['video_info'])
+        if session.get('download_type') == "both":
+            video_info = session.get('video_info')
+            if not video_info:
+                await callback.message.edit_text("❌ لا يمكن العثور على معلومات الفيديو")
+                return
+            await self.show_subtitle_language_selection(callback, video_info)
         else:
             await self.start_download(callback, state)
         
@@ -293,6 +306,10 @@ class TelegramBot:
     
     async def show_subtitle_language_selection(self, callback: CallbackQuery, video_info):
         """عرض اختيار لغة الترجمة"""
+        if not video_info:
+            await callback.message.edit_text("❌ لا يمكن الحصول على معلومات الفيديو")
+            return
+        
         available_subs = downloader.get_available_subtitles(video_info)
         
         if not available_subs:
@@ -301,8 +318,9 @@ class TelegramBot:
         
         keyboard_buttons = []
         for lang_code, sub_info in available_subs.items():
-            sub_type = "🔄" if sub_info['type'] == 'auto' else "✅"
-            button_text = f"{sub_type} {sub_info['language']}"
+            sub_type = "🔄" if sub_info.get('type') == 'auto' else "✅"
+            language_name = sub_info.get('language', 'غير معروف')
+            button_text = f"{sub_type} {language_name}"
             callback_data = f"subtitle_lang_{lang_code}"
             keyboard_buttons.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
         
@@ -369,15 +387,19 @@ class TelegramBot:
         session = self.user_sessions[user_id]
         
         if action == "confirm":
-            await self.show_quality_selection(callback, None)  # سيحتاج تعديل للقوائم
+            await self.show_quality_selection(callback, None)
         elif action == "preview":
-            await self.show_playlist_preview(callback, session['playlist_info'])
+            playlist_info = session.get('playlist_info')
+            if not playlist_info:
+                await callback.message.edit_text("❌ لا يمكن العثور على معلومات قائمة التشغيل")
+                return
+            await self.show_playlist_preview(callback, playlist_info)
         
         await callback.answer()
     
     async def show_playlist_preview(self, callback: CallbackQuery, playlist_info):
         """عرض معاينة قائمة التشغيل"""
-        entries = playlist_info.entries[:10]  # أول 10 فيديوهات
+        entries = playlist_info.entries[:10] if playlist_info.entries else []
         preview_text = f"📑 **معاينة قائمة التشغيل:** {playlist_info.title}\n\n"
         
         for i, entry in enumerate(entries, 1):
@@ -385,7 +407,7 @@ class TelegramBot:
             duration = self._format_duration(entry.get('duration', 0))
             preview_text += f"{i}. {title} ({duration})\n"
         
-        if len(playlist_info.entries) > 10:
+        if playlist_info.entries and len(playlist_info.entries) > 10:
             preview_text += f"\n... و {len(playlist_info.entries) - 10} فيديوهات أخرى"
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -399,15 +421,19 @@ class TelegramBot:
     async def start_download(self, callback: CallbackQuery, state: FSMContext):
         """بدء عملية التنزيل"""
         user_id = callback.from_user.id
+        if user_id not in self.user_sessions:
+            await callback.message.edit_text("❌ الجلسة منتهية الصلاحية")
+            return
+        
         session = self.user_sessions[user_id]
         
         # تحديث الرسالة لإظهار بدء التنزيل
         await callback.message.edit_text(config.Messages.INFO_DOWNLOADING)
         
         try:
-            if session['type'] == 'video':
+            if session.get('type') == 'video':
                 await self.download_video(callback, session, state)
-            elif session['type'] == 'playlist':
+            elif session.get('type') == 'playlist':
                 await self.download_playlist(callback, session, state)
         
         except Exception as e:
@@ -453,7 +479,11 @@ class TelegramBot:
                 logger.error(f"Progress callback error: {e}")
         
         # تنزيل الفيديو
-        if session['download_type'] in ['video', 'both']:
+        if session.get('download_type') in ['video', 'both']:
+            if not session.get('quality'):
+                await callback.message.edit_text("❌ لم يتم تحديد جودة الفيديو")
+                return
+            
             file_path = await downloader.download_video(
                 session['url'],
                 session['quality'],
@@ -465,7 +495,14 @@ class TelegramBot:
                 await self.send_file(callback.message, file_path, "video")
         
         # تنزيل الترجمة
-        if session['download_type'] in ['subtitle', 'both']:
+        if session.get('download_type') in ['subtitle', 'both']:
+            if not session.get('subtitle_lang'):
+                await callback.message.edit_text("❌ لم يتم تحديد لغة الترجمة")
+                return
+            if not session.get('subtitle_format'):
+                await callback.message.edit_text("❌ لم يتم تحديد صيغة الترجمة")
+                return
+            
             subtitle_path = await downloader.download_subtitle(
                 session['url'],
                 session['subtitle_lang'],
@@ -493,6 +530,10 @@ class TelegramBot:
             except TelegramBadRequest:
                 pass
         
+        if not session.get('quality'):
+            await callback.message.edit_text("❌ لم يتم تحديد جودة الفيديو")
+            return
+        
         result = await downloader.download_playlist(
             session['url'],
             session['quality'],
@@ -500,7 +541,7 @@ class TelegramBot:
             progress_callback=progress_callback
         )
         
-        if result['status'] == 'failed':
+        if result.get('status') == 'failed':
             await callback.message.edit_text(f"❌ فشل تنزيل قائمة التشغيل: {result.get('error', 'خطأ غير محدد')}")
             return
         
@@ -509,9 +550,9 @@ class TelegramBot:
 ✅ **تم الانتهاء من تنزيل قائمة التشغيل**
 
 📊 **النتائج:**
-• العدد الكلي: {result['total_videos']}
-• تم بنجاح: {result['completed']}
-• فشل: {result['failed']}
+• العدد الكلي: {result.get('total_videos', 0)}
+• تم بنجاح: {result.get('completed', 0)}
+• فشل: {result.get('failed', 0)}
 
 📁 تم حفظ الملفات في مجلد منفصل
         """
@@ -519,16 +560,20 @@ class TelegramBot:
         await callback.message.edit_text(summary, parse_mode="Markdown")
         
         # إرسال الملفات (الأوائل فقط لتجنب الحد الأقصى)
-        for file_path in result['downloaded_files'][:5]:
+        for file_path in result.get('downloaded_files', [])[:5]:
             if os.path.exists(file_path):
                 await self.send_file(callback.message, file_path, "video")
         
-        if len(result['downloaded_files']) > 5:
+        if len(result.get('downloaded_files', [])) > 5:
             await callback.message.answer(f"📁 تم تنزيل {len(result['downloaded_files']) - 5} ملفات إضافية")
     
     async def send_file(self, message: Message, file_path: str, file_type: str):
         """إرسال الملف للمستخدم"""
         try:
+            if not os.path.exists(file_path):
+                await message.answer("❌ الملف غير موجود")
+                return
+                
             file_size = os.path.getsize(file_path)
             
             # التحقق من حجم الملف (حد تليجرام 50 ميجا للبوت)
@@ -554,11 +599,15 @@ class TelegramBot:
             
         except Exception as e:
             logger.error(f"Error sending file: {e}")
-            await message.answer(f"❌ فشل في إرسال الملف: {file_name}")
+            await message.answer(f"❌ فشل في إرسال الملف: {os.path.basename(file_path) if file_path else 'غير معروف'}")
     
     async def show_settings_menu(self, user_id: int, message: Message):
         """عرض قائمة الإعدادات"""
         user = await db.get_user(user_id)
+        
+        if not user:
+            await message.answer("❌ لم يتم العثور على بيانات المستخدم")
+            return
         
         settings_text = f"""
 ⚙️ **إعداداتك الحالية:**
@@ -587,6 +636,9 @@ class TelegramBot:
     
     def _format_duration(self, seconds: int) -> str:
         """تنسيق المدة الزمنية"""
+        if not seconds:
+            return "غير محدد"
+            
         if seconds < 60:
             return f"{seconds}ث"
         elif seconds < 3600:
