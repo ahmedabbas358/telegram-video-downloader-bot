@@ -126,14 +126,14 @@ class Config:
 • حجم ملف أقصى: {max_size} ميجابايت
 • عدد فيديوهات قائمة التشغيل: {max_playlist} فيديو
         """.format(
-            max_size=MAX_FILE_SIZE,
-            max_playlist=MAX_PLAYLIST_SIZE
+            max_size=Config.MAX_FILE_SIZE,
+            max_playlist=Config.MAX_PLAYLIST_SIZE
         )
         
         ERROR_INVALID_URL = "❌ الرابط غير صحيح. يرجى إرسال رابط YouTube صالح."
         ERROR_DOWNLOAD_FAILED = "❌ فشل في التنزيل. يرجى المحاولة مرة أخرى."
-        ERROR_FILE_TOO_LARGE = f"❌ حجم الملف كبير جداً (أقصى حد: {MAX_FILE_SIZE} ميجابايت)"
-        ERROR_PLAYLIST_TOO_LARGE = f"❌ قائمة التشغيل كبيرة جداً (أقصى حد: {MAX_PLAYLIST_SIZE} فيديو)"
+        ERROR_FILE_TOO_LARGE = f"❌ حجم الملف كبير جداً (أقصى حد: {Config.MAX_FILE_SIZE} ميجابايت)"
+        ERROR_PLAYLIST_TOO_LARGE = f"❌ قائمة التشغيل كبيرة جداً (أقصى حد: {Config.MAX_PLAYLIST_SIZE} فيديو)"
         
         SUCCESS_DOWNLOAD = "✅ تم التنزيل بنجاح!"
         INFO_PROCESSING = "⏳ جاري المعالجة..."
