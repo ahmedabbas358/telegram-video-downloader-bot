@@ -12,6 +12,7 @@ from sqlalchemy.future import select
 from sqlalchemy import func, update, delete
 from config import config
 import logging
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ class Download(Base):
     status = Column(String(20), default='pending')  # pending, downloading, completed, failed
     file_path = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
-    file_metadata = Column(JSON, nullable=True)  # ✅ تم تغيير الاسم من metadata
+    file_metadata = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -117,8 +118,14 @@ class DatabaseManager:
         if self.engine:
             await self.engine.dispose()
     
-    async def get_session(self) -> AsyncSession:
-        return self.async_session()
+    @asynccontextmanager
+    async def get_session(self):
+        """Context manager للحصول على جلسة قاعدة البيانات"""
+        session: AsyncSession = self.async_session()
+        try:
+            yield session
+        finally:
+            await session.close()
     
     # إدارة المستخدمين
     async def get_user(self, user_id: int) -> Optional[User]:
